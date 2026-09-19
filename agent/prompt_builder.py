@@ -1250,7 +1250,13 @@ def build_skills_system_prompt(
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
+
+    When ``skills.provider: deck`` is active, the primary tier is read from deck over HTTP
+    instead of ``skills_dir`` — see ``agent.deck_skills`` — so a fresh home with no local
+    ``skills/`` directory at all still gets a populated index.
     """
+    from agent import deck_skills
+
     _home_token = None
     if skills_dir_override is not None:
         skills_dir = Path(skills_dir_override)
@@ -1262,10 +1268,12 @@ def build_skills_system_prompt(
         # Trusted project-local dirs — highest-precedence tier; cwd/trust are session-stable, so byte-stable.
         from agent.skill_utils import get_project_skills_dirs
         project_dirs = get_project_skills_dirs()
-        if not skills_dir.exists() and not external_dirs and not project_dirs:
+        deck_source = deck_skills.get_skills_source()
+        if deck_source is None and not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs,
+            deck_source=deck_source)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1380,7 +1388,7 @@ def _render_skills_index(
 def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
-    project_dirs: "list[Path] | None" = None,
+    project_dirs: "list[Path] | None" = None, deck_source: "object | None" = None,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1391,6 +1399,10 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+        # Deck's own content hashes stand in for the disk manifest signature below — the
+        # primary tier's cache key must change whenever a deck-sourced skill changes, exactly
+        # as it would from an mtime bump on a local SKILL.md.
+        ("deck", deck_source.signature()) if deck_source is not None else None,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1405,17 +1417,31 @@ def _build_skills_system_prompt_inner(
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
-    # Disk snapshot (fast path) vs. full scan: both yield (entry, is_compatible) pairs so labeling runs identically.
-    snapshot = _load_skills_snapshot(skills_dir)
-    if snapshot is not None:
-        candidates = [(entry, skill_matches_platform_list(entry.get("platforms") or []))
-                      for entry in snapshot.get("skills", []) if isinstance(entry, dict)]
-        category_descriptions = {str(k): str(v) for k, v in (snapshot.get("category_descriptions") or {}).items()}
+    snapshot = None
+    if deck_source is not None:
+        # No disk snapshot for the deck-sourced tier: the cache key above already carries
+        # deck's own hash signature, so a second on-disk cache would just be a slower,
+        # redundant copy of the same freshness check — and would touch $HERMES_HOME/skills
+        # for a tier that may have no local directory at all.
+        from agent import deck_skills
+        try:
+            candidates = deck_skills.load_skill_candidates(deck_source)
+            category_descriptions = deck_skills.read_category_descriptions(deck_source)
+        except Exception as e:
+            logger.warning("deck-skills: prompt index scan failed, continuing without the primary tier: %s", e)
+            candidates = []
     else:
-        candidates = []
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-            candidates.append((_build_snapshot_entry(skill_file, skills_dir, frontmatter, desc), is_compatible))
+        # Disk snapshot (fast path) vs. full scan: both yield (entry, is_compatible) pairs so labeling runs identically.
+        snapshot = _load_skills_snapshot(skills_dir)
+        if snapshot is not None:
+            candidates = [(entry, skill_matches_platform_list(entry.get("platforms") or []))
+                          for entry in snapshot.get("skills", []) if isinstance(entry, dict)]
+            category_descriptions = {str(k): str(v) for k, v in (snapshot.get("category_descriptions") or {}).items()}
+        else:
+            candidates = []
+            for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                candidates.append((_build_snapshot_entry(skill_file, skills_dir, frontmatter, desc), is_compatible))
     visible_entries: list[dict] = [
         entry for entry, is_compatible in candidates
         if is_compatible and not hides(_entry_name(entry), entry.get("skill_name") or "", entry.get("conditions") or {})
@@ -1430,7 +1456,7 @@ def _build_skills_system_prompt_inner(
                                   desc_prefix="[project] ", log_fmt="Error reading project skill %s: %s")
     # Drop shadowed entries BEFORE org labeling so collision flags don't fire on intentional overrides.
     _label_visible_entries([e for e in visible_entries if _entry_name(e) not in project_names], skills_by_category)
-    if snapshot is None:  # persist for fast cold-start reuse (best-effort)
+    if deck_source is None and snapshot is None:  # persist for fast cold-start reuse (best-effort)
         category_descriptions.update(_read_category_descriptions(skills_dir, "Could not read skill description %s: %s"))
         try:
             atomic_json_write(_skills_prompt_snapshot_path(), {

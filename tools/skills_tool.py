@@ -180,14 +180,45 @@ def _skill_search_dirs() -> Tuple[list, list, Path]:
     return project_dirs, all_dirs, active_skills_dir
 
 
+def _find_all_skills_deck_entries(deck_source, disabled: set) -> Tuple[List[Dict[str, Any]], set]:
+    """Deck-sourced equivalent of the disk scan's inner loop for the primary skills tier:
+    ``(skills, seen_names)`` so the caller can continue with project/external dirs using
+    the same first-wins dedup."""
+    from agent import deck_skills
+    skills: List[Dict[str, Any]] = []
+    seen_names: set = set()
+    for entry, is_compatible in deck_skills.load_skill_candidates(deck_source):
+        if not is_compatible:
+            continue
+        name = entry["frontmatter_name"][:MAX_NAME_LENGTH]
+        if name in seen_names or name in disabled:
+            continue
+        seen_names.add(name)
+        skills.append({"name": name, "description": _truncate_description(entry["description"]),
+                       "category": entry["category"]})
+    return skills, seen_names
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """All skills (name, description, category) across project/local/external dirs, first-wins
-    by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI)."""
+    by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI).
+
+    When ``skills.provider: deck`` is active, the primary tier (``$HERMES_HOME/skills``) is
+    replaced by a deck-sourced scan (``_find_all_skills_deck_entries``); project dirs and
+    ``skills.external_dirs`` are unaffected and still scanned from disk, in the same
+    first-wins precedence order as today.
+    """
+    from agent import deck_skills
     from agent.skill_utils import iter_project_skill_files, iter_skill_index_files
     cache_key = "with_disabled" if skip_disabled else "filtered"
     disabled = set() if skip_disabled else _get_disabled_skill_names()
-    project_dirs, dirs_to_scan, _ = _skill_search_dirs()
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    project_dirs, all_dirs, active_skills_dir = _skill_search_dirs()
+    deck_source = deck_skills.get_skills_source()
+    disk_dirs = [d for d in all_dirs if deck_source is None or d != active_skills_dir]
+    if deck_source is not None:
+        signature = ("deck", deck_source.signature(), _skills_scan_signature(disk_dirs, disabled))
+    else:
+        signature = _skills_scan_signature(disk_dirs, disabled)
     now = time.monotonic()
     cached = _SKILLS_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
@@ -196,7 +227,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         return [dict(s) for s in cached[2]]
     skills = []
     seen_names: set = set()
-    for scan_dir in dirs_to_scan:  # project dirs go through the quarantine chokepoint
+    if deck_source is not None:
+        try:
+            deck_skill_list, deck_names = _find_all_skills_deck_entries(deck_source, disabled)
+            skills.extend(deck_skill_list)
+            seen_names |= deck_names
+        except Exception as e:
+            logger.warning("deck-skills: primary tier scan failed, continuing without it: %s", e)
+    for scan_dir in disk_dirs:  # project dirs go through the quarantine chokepoint
         _iter = iter_project_skill_files if scan_dir in project_dirs else lambda d: iter_skill_index_files(d, "SKILL.md")
         for skill_md in _iter(scan_dir):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
@@ -233,7 +271,11 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def skills_list(category: str = None, task_id: str = None) -> str:
     """Tier 1 listing: name + description (+ category) only; ``task_id`` is handler parity."""
     try:
-        _skills_dir().mkdir(parents=True, exist_ok=True)
+        from agent import deck_skills
+        if deck_skills.get_skills_source() is None:
+            # Deck-backed skills need no local directory at all; creating one would
+            # reintroduce the file-dir dependency this mode exists to remove.
+            _skills_dir().mkdir(parents=True, exist_ok=True)
         all_skills = _find_all_skills()
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -387,6 +429,103 @@ def _skill_linked_files(skill_dir: Optional[Path]) -> dict:
         if found:
             files[sub] = found
     return files
+
+
+def _skill_linked_files_deck(source, skill_deck_dir: str) -> dict:
+    """Deck-sourced equivalent of ``_skill_linked_files``: one recursive ``/list`` call
+    over the skill's directory, grouped and extension-filtered per ``_LINKED_FILE_SPECS``."""
+    import fnmatch
+    files: dict = {}
+    try:
+        entries = source.list_dir(skill_deck_dir + "/", recursive=True)
+    except Exception as e:
+        logger.debug("deck-skills: could not list linked files for %s: %s", skill_deck_dir, e)
+        return files
+    dir_prefix = f"{skill_deck_dir}/"
+    for sub, globs, _recursive, _files_only in _LINKED_FILE_SPECS:
+        sub_prefix = f"{dir_prefix}{sub}/"
+        # Relative to the skill dir (e.g. "references/api.md"), matching _skill_linked_files
+        # and what skill_view(name, file_path=...) expects for file_path.
+        found = [
+            e["path"][len(dir_prefix):] for e in entries
+            if not e.get("is_dir") and e["path"].startswith(sub_prefix)
+            and any(fnmatch.fnmatch(e.get("name", ""), g) for g in globs)]
+        if found:
+            files[sub] = sorted(found)
+    return files
+
+
+def _serve_skill_file_deck(source, skill_deck_dir: str, file_path: str, label: str) -> str:
+    """Deck-sourced equivalent of ``_serve_skill_file``: no real filesystem, so containment
+    is enforced by rejecting ``..`` components rather than resolving+comparing paths."""
+    from tools.path_security import has_traversal_component
+    if has_traversal_component(file_path):
+        return _fail("Path traversal ('..') is not allowed.",
+                     hint="Use a relative path within the skill directory")
+    target = f"{skill_deck_dir}/{file_path.lstrip('/')}"
+    try:
+        content = source.read(target)
+    except Exception:
+        return _fail(f"File '{file_path}' not found in skill '{label}'.",
+                     available_files=_skill_linked_files_deck(source, skill_deck_dir),
+                     hint="Use one of the available file paths listed above")
+    return _json({
+        "success": True, "name": label, "file": file_path, "content": content,
+        "file_type": PurePosixPath(file_path).suffix, "_source_path": f"deck://{source.workspace}/{target}"})
+
+
+def _skill_view_deck(source, name: str, local_category_name: Optional[str], file_path: Optional[str],
+                     task_id: Optional[str], preprocess: bool) -> str:
+    """``skill_view``'s deck-sourced branch for the primary tier. Same output shape as the
+    disk path, with two deliberate gaps: no org-mirror provenance (deck has no equivalent
+    of the token-gated org mirror yet — org skills keep resolving from disk) and no
+    background-review read-marking (deck skills aren't writable via ``skill_manage`` in
+    this pass, so the guard it feeds has nothing to protect)."""
+    lookup_name = local_category_name or name
+    skill_path = source.find_skill_md(name, category_hint=local_category_name)
+    if skill_path is None:
+        return _fail(f"Skill '{lookup_name}' not found.", hint=_LOOKUP_HINT)
+    try:
+        content = source.read(skill_path)
+    except Exception as e:
+        return _fail(f"Failed to read skill '{name}' from deck: {e}")
+    frontmatter = _safe_frontmatter(content=content)
+    if not skill_matches_platform(frontmatter):
+        return _fail(f"Skill '{name}' is not supported on this platform.",
+                     readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
+    skill_deck_dir = skill_path.rsplit("/", 1)[0]
+    resolved_name = frontmatter.get("name", skill_deck_dir.rsplit("/", 1)[-1])
+    if _is_skill_disabled(resolved_name):
+        return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` "
+                     "or inspect it directly via `deck cat`.")
+    if file_path:
+        return _serve_skill_file_deck(source, skill_deck_dir, file_path, name)
+    metadata = frontmatter.get("metadata")
+    hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
+    tags, related_skills = (
+        _parse_tags(hermes_meta.get(k) or frontmatter.get(k, "")) for k in ("tags", "related_skills"))
+    linked_files = _skill_linked_files_deck(source, skill_deck_dir)
+    skill_name = frontmatter.get("name", skill_deck_dir.rsplit("/", 1)[-1])
+    readiness, readiness_extras = _skill_readiness(frontmatter, skill_name)
+    rendered_content = content if not preprocess else _preprocess_skill(
+        # No skill_dir: ${HERMES_SKILL_DIR} is left unresolved and inline-shell snippets run
+        # with the harness's own cwd rather than the (nonexistent) skill directory — see
+        # agent/skill_preprocessing.py, which already treats skill_dir=None as a valid case.
+        content, None, task_id, "Could not preprocess skill content for %s (deck)", skill_name)
+    result = {
+        "success": True, "name": skill_name, "description": frontmatter.get("description", ""),
+        "tags": tags, "related_skills": related_skills, "content": rendered_content,
+        "path": source.relative_path(skill_path), "skill_dir": None, "org_provenance": None,
+        "linked_files": linked_files if linked_files else None,
+        "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'" if linked_files else None,
+        **readiness,
+        "_source_path": f"deck://{source.workspace}/{skill_path}",
+        **readiness_extras}
+    if frontmatter.get("compatibility"):
+        result["compatibility"] = frontmatter["compatibility"]
+    if isinstance(metadata, dict):
+        result["metadata"] = metadata
+    return _json(result)
 
 
 def _org_provenance_header(skill_dir: Path, active_skills_dir: Path):
@@ -552,6 +691,19 @@ def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: l
     return None, skill_dir, skill_md
 
 
+def _is_not_found_skill_error(error_json: str) -> bool:
+    """True when ``_locate_skill``'s error is "no candidate" rather than a security or
+    ambiguity refusal. Only the former should fall through to the deck-sourced tier — a
+    collision or quarantine refusal from the project/external dirs must still surface,
+    not be silently swallowed by a deck lookup that was never the cause of the error."""
+    try:
+        msg = str(json.loads(error_json).get("error", ""))
+    except Exception:
+        return False
+    return (msg == "Skills directory does not exist yet. It will be created on first install."
+            or (msg.startswith("Skill '") and msg.endswith("' not found.")))
+
+
 def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, active_skills_dir):
     """Warn (never block) when loaded from outside the trusted dirs (project + local + external)
     and/or when common prompt-injection patterns appear. The check is on the RESOLVED path:
@@ -590,8 +742,15 @@ def skill_view(
         if local_category_name and (lookup_error := _skill_lookup_path_error(local_category_name)):
             return _fail(lookup_error, hint=_LOOKUP_HINT)
         project_dirs, all_dirs, active_skills_dir = _skill_search_dirs()
+        from agent import deck_skills
+        deck_source = deck_skills.get_skills_source()
+        # The primary tier (active_skills_dir) is deck-backed when active; project dirs and
+        # external dirs stay disk-based and keep their precedence over it either way.
+        disk_dirs = [d for d in all_dirs if deck_source is None or d != active_skills_dir]
         error, skill_dir, skill_md = _locate_skill(
-            name, local_category_name, project_dirs, all_dirs)
+            name, local_category_name, project_dirs, disk_dirs)
+        if error is not None and deck_source is not None and _is_not_found_skill_error(error):
+            return _skill_view_deck(deck_source, name, local_category_name, file_path, task_id, preprocess)
         if error is not None:
             return error
         try:  # read once — reused for platform check and main content
