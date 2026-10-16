@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from tools.mcp_user_identity import MCPUserIdentity
 
 from tools.mcp_oauth_provider import HermesProviderMixin
 
@@ -312,15 +313,16 @@ class MCPOAuthManager:
     ``_entries_lock`` (get-or-create); per-entry state by the entry's ``asyncio.Lock``."""
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], _ProviderEntry] = {}
+        self._entries: dict[tuple[str, str, str], _ProviderEntry] = {}
         self._entries_lock = threading.Lock()
         # Strong refs to in-flight 401 tasks so the loop's weak bookkeeping cannot GC them mid-run.
         self._inflight_tasks: set[asyncio.Task] = set()
 
-    def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
+    def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict],
+                              *, user_identity: MCPUserIdentity | None = None) -> Optional[Any]:
         """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
         None if the MCP SDK's OAuth support is unavailable."""
-        key = self._key(server_name)
+        key = self._key(server_name, user_identity=user_identity)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
@@ -329,18 +331,21 @@ class MCPOAuthManager:
             if entry is None:
                 entry = self._entries[key] = _ProviderEntry(server_url=server_url, oauth_config=oauth_config)
             if entry.provider is None:
-                entry.provider = self._build_provider(server_name, entry)
+                entry.provider = self._build_provider(server_name, entry, user_identity=user_identity)
                 if entry.provider is not None:
                     entry.provider._hermes_home = key[0]
             return entry.provider
 
     @staticmethod
-    def _key(server_name: str, hermes_home: str | Path | None = None) -> tuple[str, str]:
+    def _key(server_name: str, hermes_home: str | Path | None = None,
+             user_identity: MCPUserIdentity | None = None) -> tuple[str, str, str]:
         from hermes_constants import get_hermes_home
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
-        return (str(home.expanduser().resolve(strict=False)), server_name)
+        return (str(home.expanduser().resolve(strict=False)), server_name,
+                user_identity.storage_key if user_identity is not None else "")
 
-    def _build_provider(self, server_name: str, entry: _ProviderEntry) -> Optional[Any]:
+    def _build_provider(self, server_name: str, entry: _ProviderEntry,
+                        *, user_identity: MCPUserIdentity | None = None) -> Optional[Any]:
         """Build a ``HermesMCPOAuthProvider``; None if the SDK's OAuth support is unavailable."""
         if _HERMES_PROVIDER_CLS is None:
             logger.warning("MCP OAuth '%s': SDK auth module unavailable", server_name)
@@ -350,7 +355,8 @@ class MCPOAuthManager:
         from tools.mcp_oauth_provider import build_provider_kwargs, prepare_oauth_config
         if not _OAUTH_AVAILABLE:
             return None
-        cfg, storage = prepare_oauth_config(server_name, entry.server_url, entry.oauth_config)
+        cfg, storage = prepare_oauth_config(server_name, entry.server_url, entry.oauth_config,
+                                             user_identity=user_identity)
         if get_dashboard_oauth_flow() is None and not _is_interactive() and not storage.has_cached_tokens():
             raise OAuthNonInteractiveError(
                 f"MCP OAuth for '{server_name}': non-interactive environment and no cached tokens found. "
@@ -359,35 +365,40 @@ class MCPOAuthManager:
             server_name=server_name, preregistered=bool(cfg.get("client_id")), server_url=entry.server_url,
             **build_provider_kwargs(cfg, storage, ssh_proxy_hint=False))
 
-    def remove(self, server_name: str, *, hermes_home: str | Path | None = None) -> _ProviderEntry | None:
+    def remove(self, server_name: str, *, hermes_home: str | Path | None = None,
+               user_identity: MCPUserIdentity | None = None) -> _ProviderEntry | None:
         """Evict the provider from cache AND delete tokens from disk (``hermes mcp remove`` / forced re-auth)."""
-        entry = self.evict(server_name, hermes_home=hermes_home)
-        from tools.mcp_oauth import remove_oauth_tokens
-        remove_oauth_tokens(server_name, hermes_home=hermes_home)
+        entry = self.evict(server_name, hermes_home=hermes_home, user_identity=user_identity)
+        from tools.mcp_oauth import HermesTokenStorage
+        HermesTokenStorage(server_name, hermes_home=hermes_home, user_identity=user_identity).remove()
         logger.info("MCP OAuth '%s': evicted from cache and removed from disk", server_name)
         return entry
 
-    def restore_entry(self, server_name: str, entry: _ProviderEntry | None, *, hermes_home: str | Path | None = None) -> None:
+    def restore_entry(self, server_name: str, entry: _ProviderEntry | None, *, hermes_home: str | Path | None = None,
+                      user_identity: MCPUserIdentity | None = None) -> None:
         """Restore a provider entry removed for a failed reauthorization."""
         if entry is None:
             return
         with self._entries_lock:
-            self._entries.setdefault(self._key(server_name, hermes_home), entry)
+            self._entries.setdefault(self._key(server_name, hermes_home, user_identity), entry)
 
-    def evict(self, server_name: str, *, hermes_home: str | Path | None = None) -> _ProviderEntry | None:
+    def evict(self, server_name: str, *, hermes_home: str | Path | None = None,
+              user_identity: MCPUserIdentity | None = None) -> _ProviderEntry | None:
         """Drop only the in-process provider, preserving persisted OAuth state."""
         with self._entries_lock:
-            return self._entries.pop(self._key(server_name, hermes_home), None)
+            return self._entries.pop(self._key(server_name, hermes_home, user_identity), None)
 
-    async def invalidate_if_disk_changed(self, server_name: str, *, hermes_home: str | Path | None = None) -> bool:
+    async def invalidate_if_disk_changed(self, server_name: str, *, hermes_home: str | Path | None = None,
+                                         user_identity: MCPUserIdentity | None = None) -> bool:
         """Force the SDK provider to reload when the tokens file mtime changed (e.g. a cron refresh); True if so."""
-        from tools.mcp_oauth import _get_token_dir, _safe_filename
-        entry = self._entries.get(self._key(server_name, hermes_home))
+        from tools.mcp_oauth import HermesTokenStorage
+        entry = self._entries.get(self._key(server_name, hermes_home, user_identity))
         if entry is None or entry.provider is None:
             return False
         async with entry.lock:
             try:
-                mtime_ns = (_get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json").stat().st_mtime_ns
+                mtime_ns = HermesTokenStorage(server_name, hermes_home=hermes_home,
+                                              user_identity=user_identity)._tokens_path().stat().st_mtime_ns
             except OSError:
                 return False
             if mtime_ns == entry.last_mtime_ns:
@@ -406,11 +417,15 @@ class MCPOAuthManager:
             logger.info("MCP OAuth '%s': tokens file changed (mtime %d -> %d), forcing reload", server_name, old, mtime_ns)
             return True
 
-    async def _recover_401(self, server_name: str, entry: _ProviderEntry, key: str, pending: asyncio.Future) -> None:
+    async def _recover_401(self, server_name: str, entry: _ProviderEntry, key: str, pending: asyncio.Future,
+                           user_identity: MCPUserIdentity | None = None) -> None:
         """Single recovery attempt behind *pending*; always clears the dedup slot."""
         try:
             # Disk changed (external refresh)? Else: if the SDK can refresh in place, let the caller retry.
-            can_refresh = await self.invalidate_if_disk_changed(server_name)
+            if user_identity is None:
+                can_refresh = await self.invalidate_if_disk_changed(server_name)
+            else:
+                can_refresh = await self.invalidate_if_disk_changed(server_name, user_identity=user_identity)
             if not can_refresh:
                 try:
                     can_refresh = bool(entry.provider.context.can_refresh_token())
@@ -424,11 +439,12 @@ class MCPOAuthManager:
         if not pending.done():
             pending.set_result(can_refresh)
 
-    async def handle_401(self, server_name: str, failed_access_token: Optional[str] = None) -> bool:
+    async def handle_401(self, server_name: str, failed_access_token: Optional[str] = None,
+                         *, user_identity: MCPUserIdentity | None = None) -> bool:
         """Handle a 401 from a tool call. True: a (possibly new) token is available — reconnect and retry. False: no
         recovery path — surface ``needs_reauth`` so the model stops hallucinating manual refreshes. Concurrent 401s
         with the same ``failed_access_token`` fire one recovery attempt; the rest await its future."""
-        entry = self._entries.get(self._key(server_name))
+        entry = self._entries.get(self._key(server_name, user_identity=user_identity))
         if entry is None or entry.provider is None:
             return False
         key = failed_access_token or "<unknown>"
@@ -436,7 +452,7 @@ class MCPOAuthManager:
             pending = entry.pending_401.get(key)
             if pending is None:
                 pending = entry.pending_401[key] = asyncio.get_running_loop().create_future()
-                task = asyncio.create_task(self._recover_401(server_name, entry, key, pending))
+                task = asyncio.create_task(self._recover_401(server_name, entry, key, pending, user_identity))
                 self._inflight_tasks.add(task)
                 task.add_done_callback(self._inflight_tasks.discard)
         try:

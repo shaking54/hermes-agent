@@ -22,6 +22,19 @@ from tools.mcp_tool_scope import _key_name, _key_scope, _key_visible_in_scope, _
 
 logger = logging.getLogger("tools.mcp_tool")
 
+
+def _visible_servers_for_actor(servers: dict[str, dict]) -> dict[str, dict]:
+    """Separate delegated-user discovery from ordinary profile connections."""
+    from tools.mcp_user_identity import current_user_identity, delegated_oauth_server
+    from tools.registry import current_session_tool_scope
+
+    actor = current_user_identity()
+    in_user_scope = str(current_session_tool_scope() or "").startswith("mcp-user:")
+    if in_user_scope:
+        return {name: cfg for name, cfg in servers.items()
+                if delegated_oauth_server(cfg) and actor is not None and cfg.get("auth") == "oauth"}
+    return {name: cfg for name, cfg in servers.items() if not delegated_oauth_server(cfg)}
+
 # Default max concurrent MCP server connections per discovery pass (one unbounded
 # `asyncio.gather` spawned every server's subprocess tree simultaneously); config.yaml
 # ``mcp.discovery_concurrency`` overrides it, 0 = unlimited (#117373).
@@ -309,6 +322,14 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
     Also the single first-use connect point for lazy (schema-cache registered) servers, so raw tool calls
     AND the resource/prompt utility handlers all trigger the deferred spawn (#56832).
     """
+    from tools.mcp_user_identity import current_delegated_servers, current_user_identity
+    if server_name in current_delegated_servers():
+        from tools.mcp_oauth import HermesTokenStorage
+        actor = current_user_identity()
+        # A local disconnect/removal must take effect immediately even if a
+        # provider still holds the old token in a live connection's memory.
+        if actor is None or not HermesTokenStorage(server_name, user_identity=actor).has_cached_tokens():
+            return None
     with _core._lock:
         key = _resolve_server_key(server_name)
         server = _core._servers.get(key)
@@ -543,6 +564,9 @@ def register_mcp_servers(servers: dict[str, dict]) -> list[str]:
         # A troubleshooting worker never spawns MCP processes; nor may it borrow tools
         # another caller already connected in this process.
         return []
+    servers = _visible_servers_for_actor(servers)
+    if not servers:
+        return []
     if not _core._ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
@@ -613,6 +637,7 @@ def discover_mcp_tools(allowed_mcp_names: Optional[list[str]] = None) -> list[st
         return []
     with _owner_secret_scope():
         servers = _config._load_mcp_config()
+    servers = _visible_servers_for_actor(servers)
     if not servers:
         logger.debug("No MCP servers configured")
         return []
@@ -669,6 +694,7 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed."""
     with _owner_secret_scope():
         servers = _config._load_mcp_config()
+    servers = _visible_servers_for_actor(servers)
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:

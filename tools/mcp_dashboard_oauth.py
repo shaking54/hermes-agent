@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 from urllib.parse import parse_qs, urlparse
+from tools.mcp_user_identity import MCPUserIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class DashboardOAuthFlow:
     hermes_home: str
     redirect_uri: str
     reconnect_live: bool = False
+    user_identity: MCPUserIdentity | None = None
     created_at: float = field(default_factory=time.time)
     status: str = "starting"
     authorization_url: str | None = None

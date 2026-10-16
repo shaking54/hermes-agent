@@ -60,4 +60,16 @@ def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool
     for key, scopes in _core._server_tool_scopes.items():
         if scope in scopes and _key_name(key) == name and key in _core._servers:
             return key
+    # A delegated-user overlay inherits the profile's ordinary (non-delegated)
+    # connections. OAuth connections explicitly marked for messaging-user auth
+    # never take this fallback, even if an old unscoped connection exists.
+    if isinstance(scope, str) and scope.startswith("mcp-user:"):
+        from tools.mcp_user_identity import current_delegated_servers, delegated_oauth_server
+        if name in current_delegated_servers():
+            return own
+        base = scope[len("mcp-user:"):].rsplit(":", 1)[0] or None
+        candidate = _server_key(name, base, current=False)
+        server = _core._servers.get(candidate)
+        if server is not None and not delegated_oauth_server(getattr(server, "_config", {}) or {}):
+            return candidate
     return own

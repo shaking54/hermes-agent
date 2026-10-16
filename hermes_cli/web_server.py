@@ -464,6 +464,7 @@ async def auth_middleware(request: Request, call_next):
         and path.startswith("/api/")
         and path not in _PUBLIC_API_PATHS
         and not path.startswith("/api/mcp/oauth/callback/")
+        and not path.startswith("/api/mcp/user-connect/")
         and not _has_valid_session_token(request)
         and not _has_valid_query_token(request, path)
     ):

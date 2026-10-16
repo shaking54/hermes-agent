@@ -533,7 +533,9 @@ class MCPServerRunMixin:
         if self._auth_type == "oauth" and _errors._is_auth_error(root):
             from hermes_constants import get_hermes_home
             from tools.mcp_oauth import HermesTokenStorage
-            storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home())
+            from tools.mcp_user_identity import current_user_identity, delegated_oauth_server
+            actor = current_user_identity() if delegated_oauth_server(self._config or {}) else None
+            storage = HermesTokenStorage(self.name, hermes_home=get_hermes_home(), user_identity=actor)
             self._auth_park = (storage, storage.credential_stamp())
 
     async def start(self, config: dict):

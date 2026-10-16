@@ -550,6 +550,22 @@ class TeamsAdapter(BasePlatformAdapter):
                 {"group": "group_chat", "channel": "channel", "dm": "user"}.get(source.chat_type, ""),
                 str(user_id) if source.chat_type == "dm" else str(conv_id),
             )
+        from gateway.mcp_user_links import create_user_connect_link, parse_user_connect_command
+        server_name = parse_user_connect_command(text)
+        if server_name:
+            if source.chat_type != "dm":
+                await self.send(str(conv_id), "Please message Hermes privately to connect an MCP account.")
+                return
+            from tools.mcp_user_identity import MCPUserIdentity
+            try:
+                link = create_user_connect_link(
+                    server_name, MCPUserIdentity("teams", str(source.scope_id or source.guild_id or ""),
+                                                 str(user_id or "")))
+                notice = f"Connect your {server_name} MCP account (single-use, 10 minutes): {link}"
+            except ValueError as exc:
+                notice = f"MCP connection unavailable: {exc}"
+            await self.send(str(conv_id), notice)
+            return
         media: list = [m for m in [await self._cache_attachment(a) for a in getattr(activity, "attachments", None) or []] if m]
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)

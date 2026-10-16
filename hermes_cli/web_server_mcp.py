@@ -106,12 +106,13 @@ def _mcp_server_summary(name: str, cfg: dict[str, Any], plugin: str | None = Non
 
 
 _mcp_oauth_flows: "dict[str, DashboardOAuthFlow]" = {}
-_mcp_oauth_transactions: dict[tuple[str, str], threading.Lock] = {}
+_mcp_oauth_transactions: dict[tuple[str, str, str], threading.Lock] = {}
 _mcp_oauth_transactions_lock = threading.Lock()
 
 
 def _mcp_oauth_transaction(flow) -> threading.Lock:
-    key = (flow.hermes_home, flow.server_name)
+    actor = getattr(flow, "user_identity", None)
+    key = (flow.hermes_home, flow.server_name, actor.storage_key if actor is not None else "")
     with _mcp_oauth_transactions_lock:
         return _mcp_oauth_transactions.setdefault(key, threading.Lock())
 
@@ -125,6 +126,10 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         from tools.mcp_dashboard_oauth import dashboard_oauth_flow
         from tools.mcp_oauth import HermesTokenStorage, force_interactive_oauth, login_connect_timeout
         from tools.mcp_oauth_manager import get_manager
+        from tools.mcp_user_identity import delegated_oauth_server, mcp_user_identity, user_registry_scope
+        from tools.mcp_tool import _mcp_registry_scope
+        from tools.registry import session_tool_scope
+        from contextlib import nullcontext
 
         home_token = secret_token = None
         try:
@@ -132,31 +137,40 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
             secret_token = set_secret_scope(
                 build_profile_secret_scope(Path(flow.hermes_home)), profile_home=flow.hermes_home)
             transaction = _mcp_oauth_transaction(flow)
-            with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):
+            actor = getattr(flow, "user_identity", None)
+            if actor is not None and not delegated_oauth_server(cfg):
+                raise ValueError("MCP server no longer supports messaging-user OAuth")
+            overlay = (session_tool_scope(user_registry_scope(actor, flow.hermes_home,
+                       _mcp_registry_scope() or "")) if actor is not None else nullcontext())
+            with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow), \
+                    mcp_user_identity(actor, delegated_servers=(flow.server_name,) if actor is not None else ()), overlay:
                 manager = get_manager()
-                storage = HermesTokenStorage(flow.server_name)
+                storage = HermesTokenStorage(flow.server_name, user_identity=actor)
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
-                    previous_entry = manager.remove(flow.server_name, hermes_home=flow.hermes_home)
+                    previous_entry = manager.remove(flow.server_name, hermes_home=flow.hermes_home,
+                                                    user_identity=actor)
                     tools = _probe_single_server(
                         flow.server_name, cfg, connect_timeout=login_connect_timeout(cfg)
                     )
-                    if not _oauth_tokens_present(flow.server_name):
+                    if not (storage.has_cached_tokens() if actor is not None else _oauth_tokens_present(flow.server_name)):
                         raise RuntimeError(
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."
                         )
-                    _save_mcp_server(flow.server_name, cfg)
+                    if actor is None:
+                        _save_mcp_server(flow.server_name, cfg)
                     flow.tools = [{"name": t, "description": d} for t, d in tools]
                     flow.mark_approved()
-                    if flow.reconnect_live:
+                    if flow.reconnect_live and actor is None:
                         from tools.mcp_tool_loop import reconnect_mcp_server
 
                         reconnect_mcp_server(flow.server_name)
                 except Exception:
                     storage.restore(backup, only_if_absent=True)
-                    manager.restore_entry(flow.server_name, previous_entry, hermes_home=flow.hermes_home)
+                    manager.restore_entry(flow.server_name, previous_entry, hermes_home=flow.hermes_home,
+                                          user_identity=actor)
                     raise
         finally:
             if secret_token is not None:

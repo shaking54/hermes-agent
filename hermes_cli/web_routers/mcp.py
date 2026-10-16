@@ -15,7 +15,7 @@ import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_mcp import _mcp_oauth_flows, _mcp_server_summary, _normalize_mcp_server_create
@@ -299,7 +299,8 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         live = [f for f in _mcp_oauth_flows.values() if not f.worker_done]
         if len(live) >= _MAX_PENDING_MCP_OAUTH_FLOWS:
             raise HTTPException(status_code=429, detail="Too many MCP OAuth flows are already in progress")
-        if any(f.server_name == name and f.hermes_home == flow_home for f in live):
+        if any(f.server_name == name and f.hermes_home == flow_home
+               and getattr(f, "user_identity", None) is None for f in live):
             raise HTTPException(status_code=409, detail=f"MCP OAuth for '{name}' is already in progress")
         _mcp_oauth_flows[flow_id] = flow
     threading.Thread(target=_run_dashboard_mcp_oauth, args=(flow, cfg), daemon=True, name=f"mcp-oauth-{name}").start()
@@ -308,6 +309,77 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     except Exception as exc:
         flow.mark_error(exception_message(exc))
     return flow.snapshot()
+
+
+@router.get("/api/mcp/user-connect/{ticket}")
+async def user_mcp_connect_page(ticket: str, profile: Optional[str] = None):
+    """A non-consuming landing page: link-preview bots cannot spend the ticket."""
+    from gateway.mcp_user_links import _ticket_path
+
+    with _profile_secret_scope(profile):
+        try:
+            present = _ticket_path(ticket).is_file()
+        except ValueError:
+            present = False
+    if not present:
+        return HTMLResponse("<h1>Connection link expired</h1>", status_code=404)
+    return HTMLResponse(
+        "<h1>Connect your MCP account</h1><p>Continue to the provider to authorize Hermes for your account.</p>"
+        '<form method="post"><button type="submit">Continue</button></form>',
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"},
+    )
+
+
+@router.post("/api/mcp/user-connect/{ticket}")
+async def user_mcp_connect(ticket: str, request: Request, profile: Optional[str] = None):
+    """Redeem one privately delivered ticket and start a user-scoped SDK OAuth flow."""
+    from gateway.mcp_user_links import redeem_user_connect_link
+    from hermes_constants import get_hermes_home
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, exception_message
+
+    _gc_mcp_oauth_flows()
+    with _profile_secret_scope(profile):
+        try:
+            name, actor = redeem_user_connect_link(ticket)
+        except ValueError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        from hermes_cli.mcp_config import _get_mcp_servers
+        servers = _get_mcp_servers()
+        cfg = dict(servers.get(name) or {})
+        flow_home = str(get_hermes_home().expanduser().resolve(strict=False))
+    if cfg.get("auth") != "oauth" or not cfg.get("url"):
+        raise HTTPException(status_code=400, detail="MCP server is no longer configured for OAuth")
+    from tools.mcp_user_identity import delegated_oauth_server
+    if not delegated_oauth_server(cfg):
+        raise HTTPException(status_code=400, detail="MCP server no longer supports messaging-user OAuth")
+    oauth_cfg = dict(cfg.get("oauth") or {})
+    if oauth_cfg.get("client_id") and oauth_cfg.get("redirect_port"):
+        raise HTTPException(status_code=400, detail="User OAuth requires an HTTPS callback, not a pinned loopback port")
+    callback_url = _mcp_oauth_callback_url(request, name)
+    cfg["oauth"] = {**oauth_cfg, "redirect_uri": callback_url}
+    flow = DashboardOAuthFlow(
+        flow_id=secrets.token_urlsafe(24), server_name=name, profile=profile,
+        hermes_home=flow_home, redirect_uri=callback_url, user_identity=actor,
+    )
+    with _mcp_oauth_flows_lock:
+        live = [f for f in _mcp_oauth_flows.values() if not f.worker_done]
+        if len(live) >= _MAX_PENDING_MCP_OAUTH_FLOWS:
+            raise HTTPException(status_code=429, detail="Too many MCP OAuth flows are already in progress")
+        if any(f.server_name == name and f.hermes_home == flow_home
+               and getattr(f, "user_identity", None) == actor for f in live):
+            raise HTTPException(status_code=409, detail="This account is already connecting")
+        _mcp_oauth_flows[flow.flow_id] = flow
+    from agent.memory_provider import spawn_context_thread
+    spawn_context_thread(_run_dashboard_mcp_oauth, args=(flow, cfg),
+                         name=f"mcp-user-oauth-{name}").start()
+    try:
+        authorization_url = await flow.wait_for_authorization_url(timeout=30)
+    except (TimeoutError, RuntimeError) as exc:
+        flow.mark_error(exception_message(exc))
+        return HTMLResponse("<h1>Could not start authorization</h1><p>Return to Hermes and try again.</p>",
+                            status_code=502)
+    return RedirectResponse(authorization_url, status_code=303,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 @router.get("/api/mcp/oauth/flows/{flow_id}")

@@ -375,6 +375,25 @@ mcp_servers:
 
 On first connect, Hermes prints an authorize URL, opens your browser when possible, and waits for the OAuth callback on a local loopback port. Tokens are cached at `~/.hermes/mcp-tokens/<server>.json` with 0o600 perms; subsequent runs reuse them silently until refresh fails.
 
+#### Per-user OAuth from Slack or Teams (opt-in)
+
+For a shared Hermes gateway, an HTTP MCP server can instead use each messaging sender's own OAuth grant:
+
+```yaml
+dashboard:
+  public_url: "https://hermes.example.com" # HTTPS endpoint forwarding to the dashboard
+mcp_servers:
+  crm:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      identity: messaging_user
+```
+
+Run the dashboard on that public URL and register its `/api/mcp/oauth/callback/crm` URL with the provider when it requires a pre-registered OAuth client. A user sends `!mcp connect crm` to Hermes. Slack delivers a ten-minute, one-use link privately (ephemeral in a channel); Teams requires a personal chat. The user opens the link, presses **Continue**, and authorizes in the provider's browser flow. The provider credential is never read from the chat message. Hermes keys persisted tokens and live MCP connections by platform, workspace/tenant, sender, profile, and server. A user without a grant cannot borrow the profile's OAuth token or another sender's connection. Scheduled and other background turns do not use delegated credentials. No cross-platform account linking is implied.
+
+This mode is disabled unless `oauth.identity: messaging_user` is set. It needs an HTTPS dashboard callback; loopback-only `redirect_port` settings are not supported for the per-user link. Normal profile-wide `auth: oauth` servers and `hermes mcp login` retain their existing behavior.
+
 Refresh tokens are bound to the authorization server that granted them: Hermes records the discovered issuer alongside the cached tokens and, if a server's advertised authorization server ever changes (server migration, metadata edit, or hijack), the stored refresh token is dropped instead of being sent to the new issuer. The current access token keeps working until it expires, then a normal re-authorization runs against the new issuer.
 
 The redirect back from the authorization server is checked against RFC 9207: when the server's metadata advertises `authorization_response_iss_parameter_supported`, a redirect without a matching `iss` is rejected. Figma's authorization server (`https://api.figma.com`) advertises that support and then omits `iss`; Hermes fills the missing value from the discovered issuer for that one issuer and logs a warning, so `hermes mcp login figma` completes. A present-but-different `iss` is still rejected, and no other server gets the exemption.

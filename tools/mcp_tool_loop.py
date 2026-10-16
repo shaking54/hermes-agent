@@ -138,6 +138,24 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
+def _wrap_with_user_scope(coro):
+    """Carry the verified actor and registry overlay onto the dedicated MCP loop."""
+    from tools.mcp_user_identity import current_delegated_servers, current_user_identity, mcp_user_identity
+    from tools.registry import current_session_tool_scope, session_tool_scope
+
+    actor = current_user_identity()
+    delegated_servers = current_delegated_servers()
+    scope = current_session_tool_scope()
+    if actor is None and scope is None:
+        return coro
+
+    async def _scoped():
+        with mcp_user_identity(actor, delegated_servers=delegated_servers), session_tool_scope(scope):
+            return await coro
+
+    return _scoped()
+
+
 def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
     """The MCP loop when it is up, else None (read under ``_lock``)."""
     with _core._lock:
@@ -158,8 +176,8 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         raise RuntimeError("MCP event loop is not running")
     # run_coroutine_threadsafe copies the LOOP thread's context, so a per-request profile scope
     # would vanish here; re-establish it inside the task's own context.
-    coro = _wrap_with_dashboard_oauth_flow(_wrap_with_home_override(
-        coro_or_factory() if callable(coro_or_factory) else coro_or_factory))
+    coro = _wrap_with_dashboard_oauth_flow(_wrap_with_home_override(_wrap_with_user_scope(
+        coro_or_factory() if callable(coro_or_factory) else coro_or_factory)))
     future = safe_schedule_threadsafe(coro, loop, logger=logger, log_message="MCP scheduling failed")
     if future is None:
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")

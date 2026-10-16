@@ -4699,6 +4699,12 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id.startswith("G") and channel_type == "group":
             self._enterprise_private_channels[(str(team_id), str(channel_id))] = True
             self._trim_oldest_dict_entries(self._enterprise_private_channels, self._CHANNEL_TEAM_MAX)
+        from gateway.mcp_user_links import handle_slack_user_connect
+        if await handle_slack_user_connect(
+            self, original_text, team_id=team_id, user_id=user_id,
+            channel_id=channel_id, is_one_to_one_dm=is_one_to_one_dm,
+        ):
+            return
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.

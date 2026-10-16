@@ -339,6 +339,8 @@ Behavior:
 - Only applies to HTTP/StreamableHTTP transport (`url`-based servers)
 - Under a [multiplexed gateway](../user-guide/multi-profile-gateways.md), an OAuth connection is never shared across profiles: each profile authenticates with its own token and opens its own connection, even when the `mcp_servers` entries are identical
 
+For a Slack/Teams gateway to use each sender's own account, set `oauth.identity: messaging_user` on an HTTP OAuth server and configure an HTTPS `dashboard.public_url`. Each user starts authorization with `!mcp connect <server>` in Slack or a personal Teams chat; the resulting link is private, single-use, and valid for ten minutes. Its callback lands at `/api/mcp/oauth/callback/<server>`. Tokens live under the active profile's `mcp-tokens/users/<opaque-user-key>/` rather than in the profile-wide token file. This option does not authorize background jobs or link identities across platforms. See [Per-user OAuth from Slack or Teams](../user-guide/features/mcp.md#per-user-oauth-from-slack-or-teams-opt-in).
+
 ### Device-code login (RFC 8628)
 
 For an authorization server advertising `device_authorization_endpoint`, explicitly choose

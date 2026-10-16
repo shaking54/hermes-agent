@@ -196,8 +196,13 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
     if not _is_auth_error(exc):
         return None
     from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_user_identity import current_delegated_servers, current_user_identity
     try:
-        recovered = _loop._run_on_mcp_loop(lambda: get_manager().handle_401(server_name, None), timeout=10)
+        actor = current_user_identity()
+        recover = (lambda: get_manager().handle_401(server_name, None, user_identity=actor)) if (
+            actor and server_name in current_delegated_servers()) else (
+            lambda: get_manager().handle_401(server_name, None))
+        recovered = _loop._run_on_mcp_loop(recover, timeout=10)
     except Exception as rec_exc:
         logger.warning("MCP OAuth '%s': recovery attempt failed: %s", server_name, rec_exc)
         recovered = False

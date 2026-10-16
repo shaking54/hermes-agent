@@ -513,7 +513,14 @@ class MCPServerTransportMixin:
             return None
         try:
             from tools.mcp_oauth_manager import get_manager
-            return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
+            from tools.mcp_user_identity import current_user_identity, delegated_oauth_server
+            if not delegated_oauth_server(config):
+                return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
+            actor = current_user_identity()
+            if actor is None:
+                raise PermissionError(f"MCP server '{self.name}' requires a verified messaging user")
+            return get_manager().get_or_build_provider(self.name, url, config.get("oauth"),
+                                                       user_identity=actor)
         except Exception as exc:
             logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
             raise

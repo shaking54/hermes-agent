@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
 from hermes_constants import secure_parent_dir
+from tools.mcp_user_identity import MCPUserIdentity
 from utils import atomic_json_write
 from tools.mcp_dashboard_oauth import contextvar_set as _contextvar_set, get_dashboard_oauth_flow
 
@@ -413,9 +414,11 @@ class HermesTokenStorage:
     """Persist OAuth state as ``HERMES_HOME/mcp-tokens/<server_name>`` + ``.json`` (tokens),
     ``.client.json`` (client info), ``.meta.json`` (server metadata), ``.cimd-off`` (CIMD refused)."""
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None,
+                 user_identity: MCPUserIdentity | None = None):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._user_identity = user_identity
         # Issuer binding: ``loaded_issuer`` is what the token file on disk recorded (the authorization
         # server that granted the stored refresh token); ``_bound_issuer`` is stamped onto the next
         # ``set_tokens`` write. See ``tools.mcp_oauth_provider.enforce_refresh_token_issuer``.
@@ -423,7 +426,10 @@ class HermesTokenStorage:
         self._bound_issuer: str | None = None
 
     def _path(self, suffix: str) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}{suffix}"
+        token_dir = _get_token_dir(self._hermes_home)
+        if self._user_identity is not None:
+            token_dir = token_dir / "users" / self._user_identity.storage_key
+        return token_dir / f"{self._server_name}{suffix}"
 
     _tokens_path = partialmethod(_path, ".json")
     _client_info_path = partialmethod(_path, ".client.json")
@@ -612,7 +618,7 @@ class HermesTokenStorage:
         self.remove()
         if not snapshot:
             return
-        token_dir = _get_token_dir(self._hermes_home)
+        token_dir = self._tokens_path().parent
         from hermes_constants import mkdir_under_hermes_home
 
         mkdir_under_hermes_home(token_dir)
